@@ -288,6 +288,7 @@ class ModularMAML:
         self,
         task: TaskBatch,
         use_inheritance: bool = True,
+        add_to_lineage: bool = True,
     ) -> AdaptationResult:
         x_s = task.x_support.to(self.device)
         y_s = task.y_support.to(self.device)
@@ -363,13 +364,14 @@ class ModularMAML:
             x_s, y_s, adapted_pattern, params, adapted_hp
         )
 
-        node_id = self.lineage_tree.add_node(
-            pattern=adapted_pattern,
-            hyper_params=adapted_hp,
-            performance=0.0,
-            causal_effects=causal,
-            parent_id=parent_node_id,
-        )
+        node_id = None
+        if add_to_lineage:
+            node_id = self.lineage_tree.add_node(
+                pattern=adapted_pattern,
+                hyper_params=adapted_hp,
+                causal_effects=causal,
+                parent_id=parent_node_id,
+            )
 
         return AdaptationResult(
             adapted_params=params,
@@ -471,8 +473,13 @@ class ModularMAML:
         self,
         task: TaskBatch,
         use_lineage: bool = True,
+        add_to_lineage: bool = False,
     ) -> Dict[str, object]:
-        adaptation = self.adapt_to_task(task, use_inheritance=use_lineage)
+        adaptation = self.adapt_to_task(
+            task,
+            use_inheritance=use_lineage,
+            add_to_lineage=add_to_lineage,
+        )
         x_q = task.x_query.to(self.device)
         y_q = task.y_query.to(self.device)
         query_loss, perf = self._evaluate_on_query(

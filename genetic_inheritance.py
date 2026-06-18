@@ -55,7 +55,13 @@ class GeneticInheritor:
             sources.append(nid)
             freq_factor = 1.0 + 0.1 * np.log1p(node.visit_count)
             depth_decay = 1.0 / (1.0 + node.depth * 0.08)
-            perf_factor = 0.5 + 0.5 * min(node.performance, 1.0)
+
+            if node.performance > float("-inf"):
+                perf_norm = np.clip((node.performance + 5.0) / 5.0, 0.1, 1.0)
+                perf_factor = 0.3 + 0.7 * perf_norm
+            else:
+                perf_factor = 0.5
+
             raw_weights[nid] = affinity * freq_factor * depth_decay * perf_factor
 
         if not raw_weights:

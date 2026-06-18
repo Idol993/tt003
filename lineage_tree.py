@@ -16,7 +16,7 @@ class TaskNode:
     task_id: str
     pattern: ActivationPattern
     hyper_params: HyperParams
-    performance: float = 0.0
+    performance: float = float("-inf")
     causal_effects: Dict[str, float] = field(default_factory=dict)
     visit_count: int = 0
     depth: int = 0
@@ -95,7 +95,7 @@ class LineageTree:
         self,
         pattern: ActivationPattern,
         hyper_params: HyperParams,
-        performance: float = 0.0,
+        performance: Optional[float] = None,
         causal_effects: Optional[Dict[str, float]] = None,
         parent_id: Optional[str] = None,
     ) -> str:
@@ -105,18 +105,20 @@ class LineageTree:
             depth = self.nodes[parent_id].depth + 1
             self.nodes[parent_id].children_ids.append(node_id)
 
+        perf = performance if performance is not None else float("-inf")
+
         node = TaskNode(
             task_id=node_id,
             pattern=pattern,
             hyper_params=hyper_params,
-            performance=performance,
+            performance=perf,
             causal_effects=causal_effects or {},
             depth=depth,
             parent_id=parent_id,
             creation_step=self.step_counter,
         )
         self.nodes[node_id] = node
-        self.performance_history[node_id] = [performance]
+        self.performance_history[node_id] = [perf] if performance is not None else []
 
         if parent_id is None:
             self.root_ids.append(node_id)
@@ -141,7 +143,10 @@ class LineageTree:
         node = self.nodes[node_id]
         node.visit_count += 1
         if performance is not None:
-            node.performance = max(node.performance, performance)
+            if node.performance == float("-inf"):
+                node.performance = performance
+            else:
+                node.performance = max(node.performance, performance)
             self.performance_history[node_id].append(performance)
         if causal_effects is not None:
             for m, v in causal_effects.items():
@@ -150,6 +155,26 @@ class LineageTree:
             node.pattern = pattern
         if hyper_params is not None:
             node.hyper_params = hyper_params
+
+    def _valid_performances(self) -> Dict[str, float]:
+        return {
+            nid: node.performance
+            for nid, node in self.nodes.items()
+            if node.performance > float("-inf")
+        }
+
+    def _perf_rank_bonus(self, node_perf: float, valid_perfs: Dict[str, float]) -> float:
+        if not valid_perfs or node_perf == float("-inf"):
+            return 0.0
+        perfs = list(valid_perfs.values())
+        if len(perfs) < 2:
+            return 0.05
+        min_p = min(perfs)
+        max_p = max(perfs)
+        if max_p - min_p < 1e-8:
+            return 0.05
+        normalized = (node_perf - min_p) / (max_p - min_p)
+        return 0.1 * float(normalized)
 
     def find_nearest_ancestor(
         self,
@@ -171,11 +196,13 @@ class LineageTree:
             causal_effects=tmp_causal,
         )
 
+        valid_perfs = self._valid_performances()
+
         scores: List[Tuple[str, float]] = []
         for nid, node in self.nodes.items():
             affinity = query_node.composite_affinity(node, self.all_module_ids)
             depth_bonus = 1.0 / (1.0 + node.depth * 0.05)
-            perf_bonus = 0.1 * node.performance if node.performance > 0 else 0.0
+            perf_bonus = self._perf_rank_bonus(node.performance, valid_perfs)
             freq_bonus = 0.05 * min(node.visit_count, 20) / 20.0
             final_score = affinity * depth_bonus + perf_bonus + freq_bonus
             scores.append((nid, final_score))
@@ -183,10 +210,17 @@ class LineageTree:
         scores.sort(key=lambda x: x[1], reverse=True)
         return scores[:top_k]
 
-    def find_path_to_root(self, node_id: str) -> List[str]:
+    def find_path_to_root(self, node_id: str, max_depth: int = 200) -> List[str]:
         path = []
         current = node_id
-        while current is not None and current in self.nodes:
+        visited = set()
+        while (
+            current is not None
+            and current in self.nodes
+            and len(path) < max_depth
+            and current not in visited
+        ):
+            visited.add(current)
             path.append(current)
             current = self.nodes[current].parent_id
         return path
@@ -257,6 +291,16 @@ class LineageTree:
 
                     if nid_a not in self.nodes or nid_b not in self.nodes:
                         continue
+                    if nid_a == nid_b:
+                        continue
+
+                    path_a = self.find_path_to_root(nid_a)
+                    path_b = self.find_path_to_root(nid_b)
+
+                    a_is_ancestor_of_b = nid_a in path_b
+                    b_is_ancestor_of_a = nid_b in path_a
+                    if a_is_ancestor_of_b or b_is_ancestor_of_a:
+                        continue
 
                     affinity = node_a.composite_affinity(node_b, self.all_module_ids)
 
@@ -323,17 +367,21 @@ class LineageTree:
         if len(self.nodes) <= self.max_nodes:
             return []
 
-        threshold = min_performance or self.prune_threshold
+        threshold = min_performance if min_performance is not None else float("-inf")
         pruned: List[str] = []
 
-        sorted_nodes = sorted(
-            self.nodes.items(),
-            key=lambda x: (
-                x[1].performance - threshold,
-                -x[1].visit_count,
-                -x[1].creation_step,
-            ),
-        )
+        def sort_key(item):
+            nid, node = item
+            has_perf = node.performance > float("-inf")
+            perf_score = node.performance if has_perf else float("-inf")
+            return (
+                0 if has_perf else 1,
+                perf_score - threshold,
+                -node.visit_count,
+                -node.creation_step,
+            )
+
+        sorted_nodes = sorted(self.nodes.items(), key=sort_key)
 
         to_remove = max(0, len(self.nodes) - self.max_nodes)
         candidates = [nid for nid, node in sorted_nodes[: to_remove + len(sorted_nodes) // 4]]
@@ -344,7 +392,7 @@ class LineageTree:
             if nid not in self.nodes:
                 continue
             node = self.nodes[nid]
-            if node.visit_count > 10 and node.performance > threshold:
+            if node.visit_count > 10 and node.performance > threshold and node.performance > float("-inf"):
                 continue
             if node.children_ids:
                 continue
@@ -370,16 +418,26 @@ class LineageTree:
 
     def get_statistics(self) -> Dict[str, object]:
         if not self.nodes:
-            return {"num_nodes": 0, "num_roots": 0, "avg_depth": 0.0, "avg_perf": 0.0}
+            return {
+                "num_nodes": 0,
+                "num_roots": 0,
+                "avg_depth": 0.0,
+                "avg_perf": float("-inf"),
+                "best_perf": float("-inf"),
+                "valid_perf_count": 0,
+            }
         depths = [n.depth for n in self.nodes.values()]
-        perfs = [n.performance for n in self.nodes.values()]
+        valid_perfs = [n.performance for n in self.nodes.values() if n.performance > float("-inf")]
+        avg_perf = float(np.mean(valid_perfs)) if valid_perfs else float("-inf")
+        best_perf = float(max(valid_perfs)) if valid_perfs else float("-inf")
         return {
             "num_nodes": len(self.nodes),
             "num_roots": len(self.root_ids),
             "max_depth": max(depths),
             "avg_depth": float(np.mean(depths)),
-            "avg_perf": float(np.mean(perfs)),
-            "best_perf": float(max(perfs)),
+            "avg_perf": avg_perf,
+            "best_perf": best_perf,
+            "valid_perf_count": len(valid_perfs),
             "total_visits": sum(n.visit_count for n in self.nodes.values()),
         }
 
@@ -390,9 +448,10 @@ class LineageTree:
                 return
             prefix = "  " * indent
             marker = "├─ " if indent > 0 else "◆ "
+            perf_str = f"{node.performance:.3f}" if node.performance > float("-inf") else "N/A"
             print(
                 f"{prefix}{marker}[{nid}] "
-                f"depth={node.depth} perf={node.performance:.3f} "
+                f"depth={node.depth} perf={perf_str} "
                 f"visits={node.visit_count} mods={len(node.pattern.active_modules)}"
             )
             if indent >= max_depth:

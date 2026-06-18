@@ -214,14 +214,18 @@ def run_demo(args: argparse.Namespace):
 
         if step % args.log_every == 0:
             elapsed = time.time() - start_time
+            tree_stats = log.tree_stats
+            best_perf = tree_stats.get("best_perf", float("-inf"))
+            best_perf_str = f"{best_perf:.4f}" if best_perf > float("-inf") else "N/A"
             print(
                 f"[Step {step:4d}/{args.meta_steps}] "
                 f"MetaLoss={log.meta_loss:.6f} "
                 f"AdptLoss={log.avg_adapt_loss:.6f} "
                 f"Perf={log.avg_query_perf:.4f} "
-                f"Tree={log.tree_stats.get('num_nodes', 0):3d}nodes "
-                f"Roots={log.tree_stats.get('num_roots', 0):2d} "
-                f"BestPerf={log.tree_stats.get('best_perf', 0):.4f} "
+                f"Tree={tree_stats.get('num_nodes', 0):3d}nodes "
+                f"Roots={tree_stats.get('num_roots', 0):2d} "
+                f"BestPerf={best_perf_str} "
+                f"ValidPerf={tree_stats.get('valid_perf_count', 0)} "
                 f"({elapsed:.1f}s)"
             )
             if log.evolutions:
@@ -276,10 +280,13 @@ def run_demo(args: argparse.Namespace):
     }
 
     if args.output:
-        os.makedirs(os.path.dirname(args.output), exist_ok=True)
-        with open(args.output, "w") as f:
+        out_path = os.path.abspath(args.output)
+        out_dir = os.path.dirname(out_path)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        with open(out_path, "w") as f:
             json.dump(results, f, indent=2, default=lambda x: float(x) if hasattr(x, "item") else x)
-        print(f"\nResults saved to {args.output}")
+        print(f"\nResults saved to {out_path}")
 
     return results
 
@@ -290,8 +297,11 @@ def _evaluate_families(
     families: List[Dict],
     label: str,
     n_tasks: int = 3,
-):
+    add_to_lineage: bool = False,
+) -> Dict[str, object]:
     tasks = generator.generate_test_tasks(families, tasks_per_family=n_tasks)
+
+    nodes_before = len(maml.lineage_tree.nodes)
 
     pre_adapt_losses = []
     post_adapt_losses = []
@@ -306,7 +316,7 @@ def _evaluate_families(
         pre_loss = maml.criterion(pred, y_q).item()
         pre_adapt_losses.append(pre_loss)
 
-        result = maml.fast_adapt(task, use_lineage=True)
+        result = maml.fast_adapt(task, use_lineage=True, add_to_lineage=add_to_lineage)
         post_adapt_losses.append(result["query_loss"])
 
         lin = result["lineage"]
@@ -344,22 +354,50 @@ def _evaluate_families(
               f"lr={s['hp_lr']:.4f}, drop={s['hp_dropout']:.3f}, "
               f"mutations={s['mutations']}")
 
+    nodes_after = len(maml.lineage_tree.nodes)
+    if not add_to_lineage:
+        assert nodes_before == nodes_after, (
+            f"Evaluation modified lineage tree: {nodes_before} -> {nodes_after}"
+        )
+        print(f"    Lineage tree integrity: OK ({nodes_before} nodes unchanged)")
+
+    return {
+        "pre_loss": float(avg_pre),
+        "post_loss": float(avg_post),
+        "improvement_pct": float(impr),
+        "pre_std": float(np.std(pre_adapt_losses)),
+        "post_std": float(np.std(post_adapt_losses)),
+        "num_tasks": len(tasks),
+        "avg_lineage_sources": float(avg_sources),
+        "avg_diversity_penalty": float(avg_div),
+        "avg_homogenization_risk": float(avg_homog),
+        "lineage_traces": lineage_info_summary,
+        "nodes_before": nodes_before,
+        "nodes_after": nodes_after,
+    }
+
 
 def _run_ablation(
     maml: ModularMAML,
     generator: SinusoidTaskGenerator,
     families: List[Dict],
     n_tasks: int = 5,
-):
+) -> Dict[str, object]:
     tasks = generator.generate_test_tasks(families, tasks_per_family=n_tasks)
+    nodes_before = len(maml.lineage_tree.nodes)
 
     results_with = []
     results_without = []
     for task in tasks:
-        result_with = maml.fast_adapt(task, use_lineage=True)
-        result_without = maml.fast_adapt(task, use_lineage=False)
+        result_with = maml.fast_adapt(task, use_lineage=True, add_to_lineage=False)
+        result_without = maml.fast_adapt(task, use_lineage=False, add_to_lineage=False)
         results_with.append(result_with["query_loss"])
         results_without.append(result_without["query_loss"])
+
+    nodes_after = len(maml.lineage_tree.nodes)
+    assert nodes_before == nodes_after, (
+        f"Ablation modified lineage tree: {nodes_before} -> {nodes_after}"
+    )
 
     w_mean = float(np.mean(results_with))
     wo_mean = float(np.mean(results_without))
@@ -375,6 +413,19 @@ def _run_ablation(
 
     pct_better = sum(1 for w, wo in zip(results_with, results_without) if w < wo) / len(results_with) * 100
     print(f"  % tasks where lineage wins:  {pct_better:.1f}%")
+    print(f"  Lineage tree integrity: OK ({nodes_before} nodes unchanged after ablation)")
+
+    return {
+        "with_lineage_mean": w_mean,
+        "with_lineage_std": w_std,
+        "without_lineage_mean": wo_mean,
+        "without_lineage_std": wo_std,
+        "relative_gain_pct": float(gain) if wo_mean > 0 else 0.0,
+        "pct_better": float(pct_better),
+        "num_tasks": len(tasks),
+        "nodes_before": nodes_before,
+        "nodes_after": nodes_after,
+    }
 
 
 def parse_args():

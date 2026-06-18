@@ -333,6 +333,150 @@ class TestIntegration(unittest.TestCase):
         self.assertIn("query_performance", result)
         self.assertIsInstance(result["pattern"], ActivationPattern)
 
+    def test_nodes_have_valid_performance_after_training(self):
+        from modular_maml import ModularMAML, TaskBatch
+
+        torch.manual_seed(42)
+        np.random.seed(42)
+
+        all_modules = [f"mod_{i:03d}" for i in range(4)]
+        network = ModularNetwork(
+            num_modules=4, input_dim=1, output_dim=1, base_hidden_dim=16
+        )
+        tree = LineageTree(all_module_ids=all_modules, max_nodes=30)
+        inheritor = GeneticInheritor(lineage_tree=tree)
+        maml = ModularMAML(
+            network=network,
+            lineage_tree=tree,
+            inheritor=inheritor,
+            inner_steps=2,
+            first_order=True,
+            ewc_lambda=1.0,
+            evolve_every=20,
+            top_k_modules=2,
+        )
+        opt = torch.optim.Adam(network.parameters(), lr=1e-3)
+
+        def make_task():
+            amp = 0.5 + 4.5 * np.random.random()
+            phase = np.pi * np.random.random()
+            freq = 0.8 + 0.4 * np.random.random()
+            x_s = np.random.uniform(-5, 5, (6, 1)).astype(np.float32)
+            y_s = (amp * np.sin(freq * x_s + phase)).astype(np.float32)
+            x_q = np.random.uniform(-5, 5, (8, 1)).astype(np.float32)
+            y_q = (amp * np.sin(freq * x_q + phase)).astype(np.float32)
+            return TaskBatch(
+                task_id=f"t_{np.random.randint(10000)}",
+                x_support=torch.from_numpy(x_s),
+                y_support=torch.from_numpy(y_s),
+                x_query=torch.from_numpy(x_q),
+                y_query=torch.from_numpy(y_q),
+            )
+
+        for _ in range(6):
+            tasks = [make_task() for _ in range(2)]
+            maml.meta_update(tasks, opt)
+
+        stats = tree.get_statistics()
+        self.assertGreater(stats["valid_perf_count"], 0,
+                           "After training, some nodes should have valid performance scores")
+        self.assertGreater(stats["best_perf"], float("-inf"),
+                           "best_perf should not be -inf after training")
+        self.assertIsInstance(stats["avg_perf"], float)
+
+        for nid, node in tree.nodes.items():
+            if node.performance > float("-inf"):
+                self.assertIsInstance(node.performance, float)
+                self.assertLess(node.performance, 0,
+                                "For regression with MSE, performance (-loss) should be negative")
+                break
+
+    def test_fast_adapt_without_adding_to_lineage(self):
+        from modular_maml import ModularMAML, TaskBatch
+
+        torch.manual_seed(7)
+        np.random.seed(7)
+
+        all_modules = [f"mod_{i:03d}" for i in range(3)]
+        network = ModularNetwork(
+            num_modules=3, input_dim=1, output_dim=1, base_hidden_dim=16
+        )
+        tree = LineageTree(all_module_ids=all_modules, max_nodes=30)
+        inheritor = GeneticInheritor(lineage_tree=tree)
+        maml = ModularMAML(
+            network=network,
+            lineage_tree=tree,
+            inheritor=inheritor,
+            inner_steps=2,
+            first_order=True,
+            ewc_lambda=0.0,
+            evolve_every=50,
+            top_k_modules=2,
+        )
+        opt = torch.optim.Adam(network.parameters(), lr=1e-3)
+
+        def make_task():
+            amp = 1.0 + 3.0 * np.random.random()
+            x_s = np.random.uniform(-5, 5, (6, 1)).astype(np.float32)
+            y_s = (amp * np.sin(x_s)).astype(np.float32)
+            x_q = np.random.uniform(-5, 5, (8, 1)).astype(np.float32)
+            y_q = (amp * np.sin(x_q)).astype(np.float32)
+            return TaskBatch(
+                task_id=f"eval_{np.random.randint(1000)}",
+                x_support=torch.from_numpy(x_s),
+                y_support=torch.from_numpy(y_s),
+                x_query=torch.from_numpy(x_q),
+                y_query=torch.from_numpy(y_q),
+            )
+
+        for _ in range(4):
+            tasks = [make_task() for _ in range(2)]
+            maml.meta_update(tasks, opt)
+
+        nodes_before = len(tree.nodes)
+        self.assertGreater(nodes_before, 0)
+
+        for _ in range(5):
+            test_task = make_task()
+            maml.fast_adapt(test_task, use_lineage=True, add_to_lineage=False)
+            maml.fast_adapt(test_task, use_lineage=False, add_to_lineage=False)
+
+        nodes_after = len(tree.nodes)
+        self.assertEqual(nodes_before, nodes_after,
+                         "fast_adapt with add_to_lineage=False should not change tree size")
+
+    def test_output_json_current_directory(self):
+        import json
+        import os
+        import tempfile
+
+        tmp_dir = tempfile.mkdtemp()
+        cwd = os.getcwd()
+        try:
+            os.chdir(tmp_dir)
+            data = {"test": 123, "nested": {"a": [1, 2, 3]}}
+            out_path = "test_output.json"
+            with open(out_path, "w") as f:
+                json.dump(data, f)
+            self.assertTrue(os.path.exists(out_path))
+            with open(out_path, "r") as f:
+                loaded = json.load(f)
+            self.assertEqual(loaded["test"], 123)
+            os.remove(out_path)
+
+            nested_path = os.path.join("subdir", "nested.json")
+            nested_dir = os.path.dirname(nested_path)
+            os.makedirs(nested_dir, exist_ok=True)
+            with open(nested_path, "w") as f:
+                json.dump(data, f)
+            self.assertTrue(os.path.exists(nested_path))
+            import shutil
+            shutil.rmtree("subdir")
+        finally:
+            os.chdir(cwd)
+            import shutil
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
