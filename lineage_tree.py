@@ -1,0 +1,404 @@
+from __future__ import annotations
+
+import uuid
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Set, Tuple
+
+import numpy as np
+from scipy.cluster.hierarchy import linkage, fcluster
+from scipy.spatial.distance import pdist
+
+from modular_network import ActivationPattern, HyperParams
+
+
+@dataclass
+class TaskNode:
+    task_id: str
+    pattern: ActivationPattern
+    hyper_params: HyperParams
+    performance: float = 0.0
+    causal_effects: Dict[str, float] = field(default_factory=dict)
+    visit_count: int = 0
+    depth: int = 0
+    parent_id: Optional[str] = None
+    children_ids: List[str] = field(default_factory=list)
+    creation_step: int = 0
+    merged_from: List[str] = field(default_factory=list)
+
+    def feature_vector(self, all_module_ids: List[str]) -> np.ndarray:
+        pattern_vec = self.pattern.to_vector(all_module_ids)
+        hp_vec = self.hyper_params.to_tensor().numpy()
+        causal_vec = np.array(
+            [self.causal_effects.get(mid, 0.0) for mid in all_module_ids],
+            dtype=np.float32,
+        )
+        return np.concatenate([pattern_vec * 2.0, hp_vec * 0.5, causal_vec * 1.5])
+
+    def composite_affinity(
+        self,
+        other: "TaskNode",
+        all_module_ids: List[str],
+        jaccard_weight: float = 0.4,
+        causal_weight: float = 0.35,
+        hp_weight: float = 0.25,
+    ) -> float:
+        jaccard = self.pattern.jaccard_similarity(other.pattern)
+
+        common_modules = self.pattern.active_modules & other.pattern.active_modules
+        if common_modules:
+            causal_sim = 0.0
+            for m in common_modules:
+                ce_a = self.causal_effects.get(m, 0.0)
+                ce_b = other.causal_effects.get(m, 0.0)
+                if ce_a + ce_b > 0:
+                    causal_sim += 2.0 * min(ce_a, ce_b) / (ce_a + ce_b)
+            causal_sim /= len(common_modules)
+        else:
+            causal_sim = 0.0
+
+        hp_a = self.hyper_params.to_tensor().numpy()
+        hp_b = other.hyper_params.to_tensor().numpy()
+        hp_dist = np.linalg.norm(hp_a - hp_b)
+        hp_sim = float(np.exp(-hp_dist * 5.0))
+
+        return (
+            jaccard_weight * jaccard
+            + causal_weight * causal_sim
+            + hp_weight * hp_sim
+        )
+
+
+class LineageTree:
+    def __init__(
+        self,
+        all_module_ids: List[str],
+        merge_threshold: float = 0.85,
+        prune_threshold: float = 0.1,
+        max_depth: int = 10,
+        max_nodes: int = 200,
+    ):
+        self.all_module_ids = all_module_ids
+        self.merge_threshold = merge_threshold
+        self.prune_threshold = prune_threshold
+        self.max_depth = max_depth
+        self.max_nodes = max_nodes
+
+        self.nodes: Dict[str, TaskNode] = {}
+        self.root_ids: List[str] = []
+        self.step_counter: int = 0
+        self.performance_history: Dict[str, List[float]] = {}
+
+    def _generate_id(self) -> str:
+        return f"task_{uuid.uuid4().hex[:8]}"
+
+    def add_node(
+        self,
+        pattern: ActivationPattern,
+        hyper_params: HyperParams,
+        performance: float = 0.0,
+        causal_effects: Optional[Dict[str, float]] = None,
+        parent_id: Optional[str] = None,
+    ) -> str:
+        node_id = self._generate_id()
+        depth = 0
+        if parent_id and parent_id in self.nodes:
+            depth = self.nodes[parent_id].depth + 1
+            self.nodes[parent_id].children_ids.append(node_id)
+
+        node = TaskNode(
+            task_id=node_id,
+            pattern=pattern,
+            hyper_params=hyper_params,
+            performance=performance,
+            causal_effects=causal_effects or {},
+            depth=depth,
+            parent_id=parent_id,
+            creation_step=self.step_counter,
+        )
+        self.nodes[node_id] = node
+        self.performance_history[node_id] = [performance]
+
+        if parent_id is None:
+            self.root_ids.append(node_id)
+
+        self.step_counter += 1
+
+        if len(self.nodes) > self.max_nodes * 1.5:
+            self.prune()
+
+        return node_id
+
+    def update_node(
+        self,
+        node_id: str,
+        performance: Optional[float] = None,
+        causal_effects: Optional[Dict[str, float]] = None,
+        pattern: Optional[ActivationPattern] = None,
+        hyper_params: Optional[HyperParams] = None,
+    ):
+        if node_id not in self.nodes:
+            return
+        node = self.nodes[node_id]
+        node.visit_count += 1
+        if performance is not None:
+            node.performance = max(node.performance, performance)
+            self.performance_history[node_id].append(performance)
+        if causal_effects is not None:
+            for m, v in causal_effects.items():
+                node.causal_effects[m] = 0.7 * node.causal_effects.get(m, 0.0) + 0.3 * v
+        if pattern is not None:
+            node.pattern = pattern
+        if hyper_params is not None:
+            node.hyper_params = hyper_params
+
+    def find_nearest_ancestor(
+        self,
+        pattern: ActivationPattern,
+        causal_effects: Optional[Dict[str, float]] = None,
+        candidate_hp: Optional[HyperParams] = None,
+        top_k: int = 1,
+    ) -> List[Tuple[str, float]]:
+        if not self.nodes:
+            return []
+
+        tmp_causal = causal_effects or {}
+        tmp_hp = candidate_hp or HyperParams()
+
+        query_node = TaskNode(
+            task_id="_query_",
+            pattern=pattern,
+            hyper_params=tmp_hp,
+            causal_effects=tmp_causal,
+        )
+
+        scores: List[Tuple[str, float]] = []
+        for nid, node in self.nodes.items():
+            affinity = query_node.composite_affinity(node, self.all_module_ids)
+            depth_bonus = 1.0 / (1.0 + node.depth * 0.05)
+            perf_bonus = 0.1 * node.performance if node.performance > 0 else 0.0
+            freq_bonus = 0.05 * min(node.visit_count, 20) / 20.0
+            final_score = affinity * depth_bonus + perf_bonus + freq_bonus
+            scores.append((nid, final_score))
+
+        scores.sort(key=lambda x: x[1], reverse=True)
+        return scores[:top_k]
+
+    def find_path_to_root(self, node_id: str) -> List[str]:
+        path = []
+        current = node_id
+        while current is not None and current in self.nodes:
+            path.append(current)
+            current = self.nodes[current].parent_id
+        return path
+
+    def get_siblings(self, node_id: str) -> List[str]:
+        if node_id not in self.nodes:
+            return []
+        pid = self.nodes[node_id].parent_id
+        if pid is None or pid not in self.nodes:
+            return [n for n in self.root_ids if n != node_id]
+        return [c for c in self.nodes[pid].children_ids if c != node_id]
+
+    def cluster_nodes(
+        self,
+        node_ids: Optional[List[str]] = None,
+        num_clusters: Optional[int] = None,
+    ) -> Dict[int, List[str]]:
+        target_ids = node_ids or list(self.nodes.keys())
+        if len(target_ids) < 2:
+            return {0: target_ids}
+
+        features = []
+        for nid in target_ids:
+            node = self.nodes[nid]
+            features.append(node.feature_vector(self.all_module_ids))
+
+        features_np = np.vstack(features)
+        dist = pdist(features_np, metric="cosine")
+
+        if num_clusters is None:
+            num_clusters = max(2, min(len(target_ids) // 4, 10))
+        num_clusters = min(num_clusters, len(target_ids))
+
+        if len(target_ids) <= 2:
+            return {i: [target_ids[i]] for i in range(len(target_ids))}
+
+        try:
+            z = linkage(dist, method="ward")
+            labels = fcluster(z, t=num_clusters, criterion="maxclust")
+        except Exception:
+            labels = np.array([(i % num_clusters) + 1 for i in range(len(target_ids))])
+
+        clusters: Dict[int, List[str]] = {}
+        for nid, label in zip(target_ids, labels):
+            label_int = int(label)
+            if label_int not in clusters:
+                clusters[label_int] = []
+            clusters[label_int].append(nid)
+        return clusters
+
+    def merge_similar_nodes(self, force: bool = False) -> List[Tuple[str, List[str]]]:
+        if len(self.nodes) < 3:
+            return []
+
+        merges: List[Tuple[str, List[str]]] = []
+        clusters = self.cluster_nodes()
+
+        for cluster_id, member_ids in clusters.items():
+            if len(member_ids) < 2:
+                continue
+
+            members = [(nid, self.nodes[nid]) for nid in member_ids]
+
+            for i in range(len(members)):
+                for j in range(i + 1, len(members)):
+                    nid_a, node_a = members[i]
+                    nid_b, node_b = members[j]
+
+                    if nid_a not in self.nodes or nid_b not in self.nodes:
+                        continue
+
+                    affinity = node_a.composite_affinity(node_b, self.all_module_ids)
+
+                    if affinity >= self.merge_threshold or force:
+                        surviving_id, removed_id = (
+                            (nid_a, nid_b)
+                            if node_a.performance >= node_b.performance
+                            else (nid_b, nid_a)
+                        )
+                        survivor = self.nodes[surviving_id]
+                        removed = self.nodes[removed_id]
+
+                        survivor.performance = max(survivor.performance, removed.performance)
+                        survivor.visit_count += removed.visit_count
+
+                        new_active = survivor.pattern.active_modules | removed.pattern.active_modules
+                        new_weights = {}
+                        for m in new_active:
+                            wa = survivor.pattern.weights.get(m, 0.0)
+                            wb = removed.pattern.weights.get(m, 0.0)
+                            new_weights[m] = (wa + wb) / 2.0
+                        total_w = sum(new_weights.values())
+                        new_weights = {k: v / total_w for k, v in new_weights.items()}
+                        survivor.pattern = ActivationPattern(new_active, new_weights)
+
+                        for m, v in removed.causal_effects.items():
+                            survivor.causal_effects[m] = 0.5 * survivor.causal_effects.get(m, 0.0) + 0.5 * v
+
+                        survivor.hyper_params = HyperParams.crossover(
+                            survivor.hyper_params,
+                            removed.hyper_params,
+                            alpha=0.6,
+                        )
+
+                        for cid in removed.children_ids:
+                            if cid in self.nodes:
+                                self.nodes[cid].parent_id = surviving_id
+                                survivor.children_ids.append(cid)
+
+                        pid = removed.parent_id
+                        if pid is not None and pid in self.nodes:
+                            if removed_id in self.nodes[pid].children_ids:
+                                self.nodes[pid].children_ids.remove(removed_id)
+                            if surviving_id not in self.nodes[pid].children_ids:
+                                self.nodes[pid].children_ids.append(surviving_id)
+                        else:
+                            if removed_id in self.root_ids:
+                                self.root_ids.remove(removed_id)
+                            if surviving_id not in self.root_ids and survivor.parent_id is None:
+                                self.root_ids.append(surviving_id)
+
+                        survivor.merged_from.append(removed_id)
+                        survivor.merged_from.extend(removed.merged_from)
+
+                        del self.nodes[removed_id]
+                        if removed_id in self.performance_history:
+                            del self.performance_history[removed_id]
+
+                        merges.append((surviving_id, [removed_id] + removed.merged_from))
+                        break
+        return merges
+
+    def prune(self, min_performance: Optional[float] = None) -> List[str]:
+        if len(self.nodes) <= self.max_nodes:
+            return []
+
+        threshold = min_performance or self.prune_threshold
+        pruned: List[str] = []
+
+        sorted_nodes = sorted(
+            self.nodes.items(),
+            key=lambda x: (
+                x[1].performance - threshold,
+                -x[1].visit_count,
+                -x[1].creation_step,
+            ),
+        )
+
+        to_remove = max(0, len(self.nodes) - self.max_nodes)
+        candidates = [nid for nid, node in sorted_nodes[: to_remove + len(sorted_nodes) // 4]]
+
+        for nid in candidates:
+            if len(self.nodes) <= self.max_nodes:
+                break
+            if nid not in self.nodes:
+                continue
+            node = self.nodes[nid]
+            if node.visit_count > 10 and node.performance > threshold:
+                continue
+            if node.children_ids:
+                continue
+
+            pid = node.parent_id
+            if pid is not None and pid in self.nodes:
+                if nid in self.nodes[pid].children_ids:
+                    self.nodes[pid].children_ids.remove(nid)
+            if nid in self.root_ids:
+                self.root_ids.remove(nid)
+
+            del self.nodes[nid]
+            if nid in self.performance_history:
+                del self.performance_history[nid]
+            pruned.append(nid)
+
+        return pruned
+
+    def evolve(self) -> Dict[str, object]:
+        merges = self.merge_similar_nodes()
+        pruned = self.prune()
+        return {"merges": merges, "pruned": pruned}
+
+    def get_statistics(self) -> Dict[str, object]:
+        if not self.nodes:
+            return {"num_nodes": 0, "num_roots": 0, "avg_depth": 0.0, "avg_perf": 0.0}
+        depths = [n.depth for n in self.nodes.values()]
+        perfs = [n.performance for n in self.nodes.values()]
+        return {
+            "num_nodes": len(self.nodes),
+            "num_roots": len(self.root_ids),
+            "max_depth": max(depths),
+            "avg_depth": float(np.mean(depths)),
+            "avg_perf": float(np.mean(perfs)),
+            "best_perf": float(max(perfs)),
+            "total_visits": sum(n.visit_count for n in self.nodes.values()),
+        }
+
+    def print_tree(self, max_depth: int = 5):
+        def _print_subtree(nid: str, indent: int):
+            node = self.nodes.get(nid)
+            if node is None:
+                return
+            prefix = "  " * indent
+            marker = "├─ " if indent > 0 else "◆ "
+            print(
+                f"{prefix}{marker}[{nid}] "
+                f"depth={node.depth} perf={node.performance:.3f} "
+                f"visits={node.visit_count} mods={len(node.pattern.active_modules)}"
+            )
+            if indent >= max_depth:
+                return
+            for cid in node.children_ids:
+                _print_subtree(cid, indent + 1)
+
+        for rid in self.root_ids:
+            _print_subtree(rid, 0)
