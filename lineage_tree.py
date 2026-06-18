@@ -441,6 +441,147 @@ class LineageTree:
             "total_visits": sum(n.visit_count for n in self.nodes.values()),
         }
 
+    def generate_report(self, top_k: int = 10, recent_history: int = 5) -> Dict[str, object]:
+        valid_items = [
+            (nid, node)
+            for nid, node in self.nodes.items()
+            if node.performance > float("-inf")
+        ]
+        sorted_desc = sorted(valid_items, key=lambda x: x[1].performance, reverse=True)
+        sorted_asc = sorted(valid_items, key=lambda x: x[1].performance, reverse=False)
+
+        def build_node_detail(nid: str, node: TaskNode) -> Dict[str, object]:
+            history = self.performance_history.get(nid, [])
+            recent = history[-recent_history:] if history else []
+            parent_perf = None
+            if node.parent_id and node.parent_id in self.nodes:
+                pnode = self.nodes[node.parent_id]
+                parent_perf = pnode.performance if pnode.performance > float("-inf") else None
+            return {
+                "task_id": nid,
+                "performance": float(node.performance) if node.performance > float("-inf") else None,
+                "depth": node.depth,
+                "visit_count": node.visit_count,
+                "creation_step": node.creation_step,
+                "parent_id": node.parent_id,
+                "parent_performance": float(parent_perf) if parent_perf is not None else None,
+                "num_children": len(node.children_ids),
+                "active_modules": sorted(list(node.pattern.active_modules)),
+                "module_weights": {
+                    k: float(v) for k, v in node.pattern.weights.items()
+                },
+                "causal_effects": {
+                    k: float(v) for k, v in node.causal_effects.items()
+                },
+                "hyper_params": {
+                    "learning_rate": float(node.hyper_params.learning_rate),
+                    "momentum": float(node.hyper_params.momentum),
+                    "dropout_rate": float(node.hyper_params.dropout_rate),
+                    "weight_decay": float(node.hyper_params.weight_decay),
+                    "hidden_dim": int(node.hyper_params.hidden_dim),
+                },
+                "recent_performances": [float(v) for v in recent],
+                "merged_from": list(node.merged_from),
+            }
+
+        top_details = [build_node_detail(nid, n) for nid, n in sorted_desc[:top_k]]
+        bottom_details = [build_node_detail(nid, n) for nid, n in sorted_asc[:top_k]]
+
+        module_usage: Dict[str, int] = {}
+        module_best_perf: Dict[str, float] = {}
+        for nid, node in valid_items:
+            for m in node.pattern.active_modules:
+                module_usage[m] = module_usage.get(m, 0) + 1
+                cur = module_best_perf.get(m, float("-inf"))
+                if node.performance > cur:
+                    module_best_perf[m] = node.performance
+
+        depth_stats: Dict[int, Dict[str, float]] = {}
+        for nid, node in valid_items:
+            d = node.depth
+            if d not in depth_stats:
+                depth_stats[d] = {"count": 0, "perf_sum": 0.0}
+            depth_stats[d]["count"] += 1
+            depth_stats[d]["perf_sum"] += float(node.performance)
+        depth_summary = {}
+        for d, s in depth_stats.items():
+            depth_summary[str(d)] = {
+                "count": s["count"],
+                "avg_performance": float(s["perf_sum"] / max(s["count"], 1)),
+            }
+
+        return {
+            "summary": self.get_statistics(),
+            "top_tasks": top_details,
+            "bottom_tasks": bottom_details,
+            "valid_count": len(valid_items),
+            "total_count": len(self.nodes),
+            "module_usage": {m: int(c) for m, c in module_usage.items()},
+            "module_best_performance": {
+                m: float(v) if v > float("-inf") else None for m, v in module_best_perf.items()
+            },
+            "depth_breakdown": depth_summary,
+        }
+
+    @staticmethod
+    def format_report_table(
+        report: Dict[str, object],
+        title: str,
+        items: List[Dict[str, object]],
+    ) -> str:
+        if not items:
+            return f"  [{title}] No valid tasks\n"
+        lines = [f"  [{title}] Top {len(items)} by performance:"]
+        lines.append(
+            f"  {'Rank':<4} {'Perf':>8} {'Depth':>5} {'Visits':>6} {'Mods':>4} "
+            f"{'Parent':<10} {'HP-LR':>7} {'HP-Drop':>7}"
+        )
+        lines.append("  " + "-" * 70)
+        for rank, item in enumerate(items, 1):
+            perf = f"{item['performance']:.3f}" if item["performance"] is not None else "N/A"
+            mods = len(item["active_modules"])
+            parent = (item["parent_id"] or "-")[:8]
+            lr = f"{item['hyper_params']['learning_rate']:.4f}"
+            drop = f"{item['hyper_params']['dropout_rate']:.3f}"
+            lines.append(
+                f"  {rank:<4} {perf:>8} {item['depth']:>5} "
+                f"{item['visit_count']:>6} {mods:>4} {parent:<10} {lr:>7} {drop:>7}"
+            )
+        return "\n".join(lines) + "\n"
+
+    def print_report(self, top_k: int = 10):
+        report = self.generate_report(top_k=top_k)
+        print("=" * 70)
+        print("LINEAGE TASK RANKING")
+        print("=" * 70)
+        summary = report["summary"]
+        print(
+            f"  Valid: {report['valid_count']}/{report['total_count']} nodes | "
+            f"BestPerf: {summary['best_perf']:.4f} | "
+            f"AvgPerf: {summary['avg_perf']:.4f} | "
+            f"AvgDepth: {summary['avg_depth']:.2f}"
+        )
+        print()
+        print(self.format_report_table(report, "TOP PERFORMERS", report["top_tasks"]))
+        print(self.format_report_table(report, "BOTTOM PERFORMERS", report["bottom_tasks"]))
+
+        module_items = sorted(
+            report["module_usage"].items(),
+            key=lambda x: x[1],
+            reverse=True,
+        )
+        if module_items:
+            print("  [MODULE USAGE] (usage_count, best_perf)")
+            line_parts = []
+            for m, c in module_items:
+                bp = report["module_best_performance"].get(m)
+                bp_str = f"{bp:.3f}" if bp is not None else "N/A"
+                line_parts.append(f"{m}({c},{bp_str})")
+            print("  " + "  ".join(line_parts))
+            print()
+        print("=" * 70)
+        return report
+
     def print_tree(self, max_depth: int = 5):
         def _print_subtree(nid: str, indent: int):
             node = self.nodes.get(nid)

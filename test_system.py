@@ -477,6 +477,219 @@ class TestIntegration(unittest.TestCase):
             import shutil
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
+    def test_run_demo_saves_current_directory_output(self):
+        import json
+        import os
+        import sys
+        import tempfile
+
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+        tmp_dir = tempfile.mkdtemp()
+        cwd = os.getcwd()
+        created_files = []
+        try:
+            os.chdir(tmp_dir)
+            import demo
+            out_name = "demo_shortrun.json"
+            result = demo.run_demo(
+                None,
+                seed=1,
+                num_modules=3,
+                hidden_dim=16,
+                top_k_modules=2,
+                inner_steps=2,
+                meta_steps=3,
+                tasks_per_batch=2,
+                log_every=3,
+                evolve_every=50,
+                eval_repeats=1,
+                merge_threshold=0.95,
+                max_tree_nodes=80,
+                ablation=False,
+                output=out_name,
+            )
+            created_files.append(os.path.abspath(out_name))
+            self.assertIn("_output_path", result)
+            self.assertTrue(os.path.exists(result["_output_path"]))
+            with open(result["_output_path"], "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            self.assertIn("final_stats", loaded)
+            self.assertIn("lineage_report", loaded)
+            self.assertIn("eval_seen_repeated", loaded)
+            self.assertIn("eval_novel_repeated", loaded)
+            self.assertIn("meta_loss_history", loaded)
+            self.assertEqual(len(loaded["meta_loss_history"]), 3)
+            report = loaded["lineage_report"]
+            self.assertIn("top_tasks", report)
+            self.assertIn("bottom_tasks", report)
+            self.assertIn("summary", report)
+            self.assertIn("module_usage", report)
+            self.assertGreater(report["valid_count"], 0)
+            self.assertGreater(report["summary"]["best_perf"], float("-inf"))
+        finally:
+            os.chdir(cwd)
+            for fp in created_files:
+                try:
+                    os.remove(fp)
+                except Exception:
+                    pass
+            import shutil
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_run_demo_saves_nested_output_directory(self):
+        import json
+        import os
+        import sys
+        import tempfile
+
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+        tmp_dir = tempfile.mkdtemp()
+        cwd = os.getcwd()
+        created_dirs = []
+        try:
+            os.chdir(tmp_dir)
+            import demo
+            out_path = os.path.join("nested", "a", "b", "out.json")
+            result = demo.run_demo(
+                None,
+                seed=2,
+                num_modules=3,
+                hidden_dim=16,
+                top_k_modules=2,
+                inner_steps=2,
+                meta_steps=3,
+                tasks_per_batch=2,
+                log_every=3,
+                evolve_every=50,
+                eval_repeats=1,
+                merge_threshold=0.95,
+                max_tree_nodes=80,
+                ablation=False,
+                output=out_path,
+            )
+            created_dirs.append(os.path.abspath("nested"))
+            self.assertIn("_output_path", result)
+            self.assertTrue(os.path.exists(result["_output_path"]))
+            self.assertTrue(
+                result["_output_path"].endswith(os.path.join("nested", "a", "b", "out.json"))
+            )
+            with open(result["_output_path"], "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            self.assertIn("config", loaded)
+            self.assertEqual(loaded["config"]["meta_steps"], 3)
+        finally:
+            os.chdir(cwd)
+            for dp in created_dirs:
+                import shutil
+                shutil.rmtree(dp, ignore_errors=True)
+            import shutil
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_run_demo_eval_repeats_produces_aggregate(self):
+        import os
+        import sys
+        import tempfile
+
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+        tmp_dir = tempfile.mkdtemp()
+        cwd = os.getcwd()
+        try:
+            os.chdir(tmp_dir)
+            import demo
+            result = demo.run_demo(
+                None,
+                seed=3,
+                num_modules=3,
+                hidden_dim=16,
+                top_k_modules=2,
+                inner_steps=2,
+                meta_steps=2,
+                tasks_per_batch=2,
+                log_every=2,
+                evolve_every=50,
+                eval_repeats=2,
+                merge_threshold=0.95,
+                max_tree_nodes=80,
+                ablation=True,
+                output="",
+            )
+            seen_eval = result["eval_seen_repeated"]
+            self.assertEqual(seen_eval["aggregate"]["repeats"], 2)
+            self.assertEqual(len(seen_eval["repeat_results"]), 2)
+            self.assertGreaterEqual(
+                seen_eval["repeat_results"][0]["num_tasks"],
+                2,
+            )
+            self.assertIsInstance(seen_eval["aggregate"]["post_loss_grand_mean"], float)
+            self.assertIsInstance(seen_eval["aggregate"]["post_loss_grand_std"], float)
+
+            novel_eval = result["eval_novel_repeated"]
+            self.assertEqual(novel_eval["aggregate"]["repeats"], 2)
+
+            ablation = result["ablation"]
+            self.assertIsNotNone(ablation)
+            self.assertEqual(ablation["aggregate"]["repeats"], 2)
+            self.assertEqual(len(ablation["repeat_results"]), 2)
+            first_rep = ablation["repeat_results"][0]
+            self.assertIn("order_independence_check", first_rep)
+            self.assertIsInstance(
+                first_rep["order_independence_check"]["delta_diff_max_abs"],
+                float,
+            )
+            self.assertIn("wins", first_rep)
+            self.assertIn("ties", first_rep)
+            self.assertIn("losses", first_rep)
+            self.assertEqual(
+                first_rep["wins"] + first_rep["ties"] + first_rep["losses"],
+                first_rep["num_tasks"],
+            )
+        finally:
+            os.chdir(cwd)
+            import shutil
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_lineage_tree_report_contains_top_bottom_structure(self):
+        tree = LineageTree(
+            all_module_ids=[f"mod_{i:03d}" for i in range(4)],
+            max_nodes=20,
+        )
+        perfs = [0.1, 0.5, -0.2, -1.0, 0.3]
+        for i, p in enumerate(perfs):
+            mods = {f"mod_{i % 4:03d}", f"mod_{(i + 1) % 4:03d}"}
+            tree.add_node(
+                ActivationPattern(mods),
+                HyperParams(learning_rate=0.001 * (i + 1)),
+                performance=p,
+                causal_effects={m: 0.5 for m in mods},
+            )
+
+        report = tree.generate_report(top_k=3, recent_history=3)
+        self.assertEqual(len(report["top_tasks"]), 3)
+        self.assertEqual(len(report["bottom_tasks"]), 3)
+        self.assertEqual(report["valid_count"], 5)
+        top_perfs = [t["performance"] for t in report["top_tasks"]]
+        bot_perfs = [t["performance"] for t in report["bottom_tasks"]]
+        self.assertGreaterEqual(top_perfs[0], top_perfs[-1])
+        self.assertLessEqual(bot_perfs[0], bot_perfs[-1])
+        for t in report["top_tasks"]:
+            self.assertIn("task_id", t)
+            self.assertIn("active_modules", t)
+            self.assertIn("hyper_params", t)
+            self.assertIn("parent_id", t)
+            self.assertIn("visit_count", t)
+            self.assertIn("recent_performances", t)
+            self.assertIn("module_weights", t)
+            self.assertIn("causal_effects", t)
+            self.assertIn("num_children", t)
+            self.assertIn("parent_performance", t)
+        self.assertIn("summary", report)
+        self.assertIn("module_usage", report)
+        self.assertIn("depth_breakdown", report)
+        self.assertIn("module_best_performance", report)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
